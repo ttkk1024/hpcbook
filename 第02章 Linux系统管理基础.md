@@ -8,124 +8,125 @@
 对于HPC环境，推荐使用以下Linux发行版：
 
 **企业级选择：**
-- **CentOS Stream / RHEL**：企业级稳定性，长期支持
-- **Ubuntu LTS**：用户友好，更新及时
-- **SUSE Linux Enterprise**：企业级功能，良好硬件支持
+- **CentOS Stream 9 / RHEL 9**：企业级标准
+- **Ubuntu 22.04/24.04 LTS**：AI 和深度学习领域常用
+- **openEuler**：国内 HPC 环境常用
 
 **HPC专用选择：**
-- **Rocky Linux**：RHEL兼容，社区驱动
-- **AlmaLinux**：RHEL二进制兼容
-- **OpenHPC**：专门为HPC优化的发行版
+- **Rocky Linux 9 / AlmaLinux 9**：RHEL 的最佳开源替代
+- **OpenHPC**：提供完整的 HPC 软件栈 (基于 EL9/OpenSUSE)
 
-#### 硬件要求规划
+#### 硬件要求规划 (2025参考)
 
 **管理节点配置：**
 ```
-CPU: 16-32核，支持虚拟化
-内存: 64-128GB
-存储: 1TB SSD (系统) + 10TB HDD (数据)
-网络: 双10GbE网卡
+CPU: 32-64核，支持虚拟化
+内存: 128-256GB
+存储: 2TB NVMe SSD (系统) + 20TB HDD (镜像/数据)
+网络: 双25GbE网卡 (做了Bonding)
 ```
 
 **计算节点配置：**
 ```
-CPU: 32-64核，高主频
-内存: 128-512GB
-存储: 500GB SSD (本地)
-网络: 10/25/100GbE网卡
+CPU: 64-192核 (双路 EPYC/Xeon)，高主频
+内存: 256GB-1TB (推荐每核心配比 4GB+)
+存储: 1TB NVMe SSD (本地暂存)
+网络: 200/400Gbps InfiniBand/ROCE (计算网) + 25GbE (管理网)
 ```
 
 **存储节点配置：**
 ```
-CPU: 8-16核
-内存: 32-64GB
-存储: 100TB+ HDD阵列
-网络: 10/25GbE网卡
+CPU: 16-32核
+内存: 64-128GB
+存储: PB级并行存储阵列 (HDD + NVMe Cache)
+网络: 100/200/400GbE/IB 网卡
 ```
 
 ### 批量安装准备
 
-#### PXE网络安装环境搭建
+#### PXE/UEFI 网络安装环境搭建 (EL9)
 
 ```bash
-# 1. 安装DHCP服务器
-yum install dhcp-server
+# 1. 安装基础服务 (dnf 替代 yum)
+dnf install dhcp-server tftp-server httpd syslinux shim shim-x64 grub2-efi-x64
 
 # 2. 配置DHCP服务 (/etc/dhcp/dhcpd.conf)
 subnet 192.168.1.0 netmask 255.255.255.0 {
     range 192.168.1.100 192.168.1.200;
     option routers 192.168.1.1;
-    option domain-name-servers 8.8.8.8;
     next-server 192.168.1.10;  # TFTP服务器IP
-    filename "pxelinux.0";     # PXE启动文件
+    
+    # UEFI 支持判断
+    if option arch = 00:07 {
+        filename "grubx64.efi";
+    } else {
+        filename "pxelinux.0";
+    }
 }
 
-# 3. 安装TFTP服务器
-yum install tftp-server
-systemctl enable tftp
+# 3. 启动服务
+systemctl enable --now dhcpd tftp httpd
 ```
 
-#### Kickstart自动化安装
+#### Kickstart自动化安装 (EL9 语法)
 
 ```bash
 # 创建Kickstart配置文件 (/var/www/html/ks.cfg)
-#version=RHEL7
+#version=RHEL9
+
 # System authorization information
-auth --enableshadow --passalgo=sha512
+authselect --useshadow --passalgo=sha512
 
 # Use network installation
-url --url="http://192.168.1.10/centos7"
+url --url="http://192.168.1.10/rocky9"
 
 # Use text mode install
 text
 
-# Keyboard layouts
-keyboard --vckeymap=us --xlayouts='us'
-
 # System language
 lang en_US.UTF-8
+keyboard --vckeymap=us --xlayouts='us'
 
 # Network information
-network --bootproto=static --device=eth0 --gateway=192.168.1.1 \
-        --ip=192.168.1.100 --nameserver=8.8.8.8 --netmask=255.255.255.0 \
-        --activate
+network --bootproto=dhcp --device=link --activate
 
 # Root password
 rootpw --iscrypted $6$...
 
 # System services
-services --disabled="postfix" --enabled="chronyd,sshd"
+services --enabled="chronyd,sshd"
 
 # System timezone
 timezone Asia/Shanghai --isUtc
 
-# System bootloader configuration
-bootloader --location=mbr --boot-drive=sda
-
-# Clear the Master Boot Record
-zerombr
-
-# Partition clearing information
-clearpart --all --initlabel
-
 # Disk partitioning information
-part /boot --fstype="xfs" --ondisk=sda --size=1024
-part / --fstype="xfs" --ondisk=sda --grow --size=1
-part swap --fstype="swap" --ondisk=sda --size=8192
+zerombr
+clearpart --all --initlabel
+# 推荐使用 LVM
+part /boot/efi --fstype="efi" --size=600
+part /boot --fstype="xfs" --size=1024
+part pv.01 --size=1 --grow
+volgroup rl pv.01
+logvol / --fstype="xfs" --name=root --vgname=rl --size=51200
+logvol /home --fstype="xfs" --name=home --vgname=rl --size=1 --grow
+logvol swap --fstype="swap" --name=swap --vgname=rl --size=8192
 
 %packages
-@base
-@core
+@^minimal-environment
 @development
 chrony
 wget
 curl
+# 常用运维工具
+vim
+net-tools
+bind-utils
+nfsv4-client-utils
 %end
 
 %post
-# 安装完成后配置
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-systemctl enable chronyd
+echo "nameserver 223.5.5.5" > /etc/resolv.conf
+systemctl enable --now chronyd
 %end
 ```
 
@@ -133,19 +134,14 @@ systemctl enable chronyd
 
 ```bash
 # 1. 挂载ISO镜像
-mount -o loop CentOS-7-x86_64-DVD-1810.iso /mnt
+mount -o loop Rocky-9.3-x86_64-dvd.iso /mnt
 
 # 2. 复制安装文件
-cp -r /mnt/* /var/www/html/centos7/
+mkdir -p /var/www/html/rocky9
+cp -r /mnt/* /var/www/html/rocky9/
 
-# 3. 配置Apache服务
-yum install httpd
-systemctl enable httpd
-systemctl start httpd
-
-# 4. 配置防火墙
-firewall-cmd --permanent --add-service=http
-firewall-cmd --reload
+# 3. 处理 SELinux (如果开启)
+restorecon -Rv /var/www/html/
 ```
 
 ### 系统优化配置
@@ -280,13 +276,16 @@ setfacl -b /data/shared
 #### sudo权限配置
 
 ```bash
-# 编辑 /etc/sudoers 或创建文件 /etc/sudoers.d/hpc-admins
+# 编辑 /etc/sudoers (推荐使用 visudo)
+# 或者在 /etc/sudoers.d/ 下创建文件
+
+# 允许 hpc-admins 组无密码 sudo
 %hpc-admins ALL=(ALL) NOPASSWD: ALL
 
-# 限制特定命令
-researcher1 ALL=(root) /usr/sbin/parted, /usr/bin/yum
+# 精细化权限控制
+researcher1 ALL=(root) /usr/sbin/parted, /usr/bin/dnf
 
-# 日志记录
+# 日志审计
 Defaults logfile=/var/log/sudo.log
 Defaults log_input, log_output
 ```
@@ -314,23 +313,38 @@ ssh-copy-id -i ~/.ssh/hpc_key.pub user@compute-node1
 ssh -i ~/.ssh/hpc_key user@compute-node1
 ```
 
-#### LDAP集成
+#### 集中式身份认证 (FreeIPA / LDAP)
+
+现代 HPC 环境推荐使用 FreeIPA 代替纯 LDAP 配置，管理更简单且包含 Kerberos。
 
 ```bash
-# 1. 安装LDAP客户端
-yum install openldap-clients nss-pam-ldapd
+# 1. 安装 FreeIPA 客户端 (EL9)
+dnf install ipa-client
 
-# 2. 配置LDAP (/etc/openldap/ldap.conf)
-BASE dc=hpc,dc=edu,dc=cn
-URI ldap://ldap-server.hpc.edu.cn
+# 2. 加入域 (交互式)
+ipa-client-install --mkhomedir --enable-dns-updates
 
-# 3. 配置NSS (/etc/nsswitch.conf)
-passwd: files ldap
-group: files ldap
-shadow: files ldap
+# 3. 验证身份
+kinit researcher1
+id researcher1
+```
 
-# 4. 测试LDAP连接
-ldapsearch -x -b "dc=hpc,dc=edu,dc=cn" "(uid=testuser)"
+若仍需手动配置 LDAP (EL9 使用 sssd):
+
+```bash
+# 1. 安装 sssd
+dnf install sssd sssd-tools openldap-clients
+
+# 2. 配置 authselect (关键步骤)
+authselect select sssd with-mkhomedir --force
+
+# 3. 配置 SSSD (/etc/sssd/sssd.conf)
+[domain/hpc]
+id_provider = ldap
+auth_provider = ldap
+ldap_uri = ldap://ldap-server.hpc.edu.cn
+ldap_search_base = dc=hpc,dc=edu,dc=cn
+...
 ```
 
 ## 2.3 文件系统管理
@@ -455,38 +469,20 @@ done
 
 ### 网络接口配置
 
-#### 多网卡绑定
+#### 多网卡绑定 (使用 nmcli)
+
+RHEL/CentOS 7 之后的系统推荐使用 NetworkManager (`nmcli`) 进行配置。
 
 ```bash
-# 1. 安装绑定模块
-modprobe bonding
+# 1. 创建 Bond 接口 (mode 4 = 802.3ad LACP)
+nmcli con add type bond con-name bond0 ifname bond0 mode 802.3ad ipv4.method manual ipv4.addresses 192.168.1.10/24 ipv4.gateway 192.168.1.1
 
-# 2. 配置网卡绑定
-# 创建 /etc/sysconfig/network-scripts/ifcfg-bond0
-DEVICE=bond0
-TYPE=Bond
-BONDING_MASTER=yes
-BOOTPROTO=static
-IPADDR=192.168.1.10
-NETMASK=255.255.255.0
-GATEWAY=192.168.1.1
-ONBOOT=yes
-BONDING_OPTS="mode=4 miimon=100 lacp_rate=fast"
+# 2. 添加从接口 (Slaves)
+nmcli con add type ethernet slave-type bond con-name bond0-port1 ifname eth0 master bond0
+nmcli con add type ethernet slave-type bond con-name bond0-port2 ifname eth1 master bond0
 
-# 3. 配置从网卡
-# ifcfg-eth0
-DEVICE=eth0
-BOOTPROTO=none
-ONBOOT=yes
-MASTER=bond0
-SLAVE=yes
-
-# ifcfg-eth1
-DEVICE=eth1
-BOOTPROTO=none
-ONBOOT=yes
-MASTER=bond0
-SLAVE=yes
+# 3. 激活连接
+nmcli con up bond0
 ```
 
 #### InfiniBand配置
@@ -565,20 +561,19 @@ ntttcp -r  # 接收端
 #### 网络故障诊断
 
 ```bash
-# 1. 网络连通性检查
+# 1. 现代网络工具替换
 ping -c 3 gateway-ip
-traceroute target-host
+tracepath target-host   # 替代 traceroute
 
-# 2. 端口状态检查
-netstat -tuln
+# 2. 端口检查 (ss 替代 netstat)
 ss -tuln
+ss -tip
 
-# 3. 网络接口状态
-ip link show
-ethtool eth0
+# 3. 接口详细信息
+ip -d link show bond0
+ethtool -S eth0         # 查看网卡统计(丢包/错误)
 
-# 4. ARP表检查
-arp -a
+# 4. 邻居表 (ARP)
 ip neigh show
 ```
 
@@ -610,20 +605,35 @@ nload
 sar -n DEV 1 10
 ```
 
-#### 高级监控工具
+#### 基础监控工具 (Modern)
 
 ```bash
-# 1. 安装sysstat套件
-yum install sysstat
+# 1. 增强型终端监控
+htop    # 交互式进程查看
+btop    # 现代化资源监控 UI (推荐)
+dstat   # 多功能系统资源统计 (dnf install dstat)
 
-# 2. 配置数据收集
-# 编辑 /etc/cron.d/sysstat
-*/10 * * * * root /usr/lib64/sa/sa1 1 1
-
-# 3. 查看历史数据
-sar -u -s 09:00:00 -e 17:00:00
-sar -r -s 09:00:00 -e 17:00:00
+# 2. 历史数据记录 (pcp / sysstat)
+dnf install pcp-system-tools
+pmchart # 图形化分析
 ```
+
+#### 企业级监控平台 (Prometheus + Grafana)
+
+HPC 集群通常采用分布式监控方案：
+
+1.  **Node Exporter** (部署在所有节点):
+    - 收集 CPU/Mem/Disk/Net 指标
+    - 暴露 metrics 给 Prometheus
+    
+2.  **Prometheus** (部署在管理节点):
+    - 时序数据库，拉取数据
+    - 强大的 PromQL 查询语言
+
+3.  **Grafana** (部署在管理节点):
+    - 可视化大屏
+    - 预警通知
+
 
 ### 性能分析工具
 
@@ -635,12 +645,11 @@ perf top -p pid
 perf record -p pid
 perf report
 
-# 2. 使用oprofile分析
-opcontrol --init
-opcontrol --start
-# 运行程序
-opcontrol --stop
-opreport
+# 2. 使用 eBPF 工具 (bcc-tools) 分析
+# dnf install bcc-tools
+/usr/share/bcc/tools/execsnoop  # 监控进程执行
+/usr/share/bcc/tools/biolatency # 块设备 I/O 延迟分布
+/usr/share/bcc/tools/profile    # CPU 采样剖析
 ```
 
 #### 内存分析
@@ -724,7 +733,7 @@ sysbench cpu --cpu-max-prime=20000 run
 ./xhpl
 
 # 3. 使用SPEC CPU测试
-./runspec --config=myconfig --rate=base cpu2006
+./runspec --config=myconfig --rate=base cpu2017
 ```
 
 #### 内存基准测试
